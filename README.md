@@ -175,7 +175,7 @@ color-correction --help
 ## Updating
 
 ```bash
-python3 -m pip install --user --upgrade --no-cache-dir "git+https://github.com/YOURORG/color-correction.git"
+python3 -m pip install --user --upgrade --no-cache-dir "git+https://github.com/chickensavory/color-correction.git"
 ```
 
 ---
