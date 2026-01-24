@@ -4,11 +4,14 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Dict, Any
+from datetime import date
+import time
+
+from color_correction_tool.xmp import write_processed_tags
 
 import numpy as np
 from PIL import Image, ImageOps
 import cv2
-import time
 
 try:
     import rawpy
@@ -30,6 +33,8 @@ IMG_EXTS = {
     ".png",
 }
 ALL_EXTS = RAW_EXTS | IMG_EXTS
+
+PROCESS_TOOL = "color-correction"
 
 
 @dataclass
@@ -538,6 +543,28 @@ def process_bgr16(bgr16: np.ndarray, cfg: Config) -> Tuple[np.ndarray, Dict[str,
     return float01_to_bgr8(bgr01), dbg
 
 
+def _add_processed_tags(
+    image_path: Path,
+    *,
+    tool: str = PROCESS_TOOL,
+    processed_date: Optional[str] = None,
+) -> bool:
+    processed_date = processed_date or date.today().isoformat()
+
+    ok = write_processed_tags(
+        image_path,
+        tool=tool,
+        processed_date=processed_date,
+    )
+
+    if ok:
+        print(f"[XMP] tagged: {image_path.name} (tool={tool} date={processed_date})")
+    else:
+        print(f"[XMP] FAILED to tag: {image_path.name}")
+
+    return ok
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=str, default="input", help="Input folder")
@@ -632,6 +659,9 @@ def main() -> None:
 
     count_in = 0
     count_out = 0
+    count_tagged = 0
+
+    run_date = date.today().isoformat()
 
     for p in iter_images(input_dir):
         count_in += 1
@@ -646,6 +676,9 @@ def main() -> None:
         out_path = (output_dir / rel).with_suffix(".jpg")
         write_jpeg(out_path, out8, cfg.jpeg_quality)
         count_out += 1
+
+        if _add_processed_tags(out_path, tool=PROCESS_TOOL, processed_date=run_date):
+            count_tagged += 1
 
         ex = dbg.get("exposure", {})
         ml = dbg.get("midtone_lift", {})
@@ -666,6 +699,7 @@ def main() -> None:
     rate = (count_out / total) if total > 0 else 0.0
     print(
         f"Done. Read {count_in} files, wrote {count_out} JPEGs to {output_dir}. "
+        f"XMP tagged {count_tagged}/{count_out}. "
         f"Total={total:.2f}s ({rate:.2f} img/s, {rate*60:.1f} img/min)"
     )
 
