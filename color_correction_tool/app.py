@@ -541,7 +541,7 @@ def process_bgr16(bgr16: np.ndarray, cfg: Config) -> Tuple[np.ndarray, Dict[str,
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=str, default="input", help="Input folder")
-    ap.add_argument("--output", type=str, default="output/fixed_", help="Output folder")
+    ap.add_argument("--output", type=str, default="output", help="Output folder")
     ap.add_argument(
         "--quality", type=int, default=CFG.jpeg_quality, help="JPEG quality (1-100)"
     )
