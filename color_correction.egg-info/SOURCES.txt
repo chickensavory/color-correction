@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+color_correction.egg-info/PKG-INFO
+color_correction.egg-info/SOURCES.txt
+color_correction.egg-info/dependency_links.txt
+color_correction.egg-info/entry_points.txt
+color_correction.egg-info/requires.txt
+color_correction.egg-info/top_level.txt
+color_correction_tool/__init__.py
+color_correction_tool/app.py

@@ -1,0 +1,2 @@
+[console_scripts]
+color-correction = color_correction_tool.app:main

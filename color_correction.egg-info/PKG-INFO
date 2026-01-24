@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: color-correction
+Version: 0.1.1
+Summary: CLI tool to automatically basic edit images
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: opencv-python
+Requires-Dist: numpy
+Requires-Dist: pillow
+Requires-Dist: rawpy
+
+# color-correction

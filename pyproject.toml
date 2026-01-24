@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "color-correction"
+version = "0.1.1"
+description = "CLI tool to automatically basic edit images"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "opencv-python",
+  "numpy",
+  "pillow",
+  "rawpy",
+]
+
+[project.scripts]
+color-correction = "color_correction_tool.app:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["color_correction_tool*"]
