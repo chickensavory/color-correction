@@ -218,5 +218,3 @@ If RAW is unavailable, the tool will warn and skip RAW files.
 * First run on new images? Keep a backup, just in case
 * Designed for fast, consistent product-style image correction
 
-```
-```
