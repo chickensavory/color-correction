@@ -51,7 +51,7 @@ Press:
 
 ```bash
 python3 -m pip install --user --upgrade pip
-python3 -m pip install --no-cache-dir "git+https://github.com/YOURORG/color-correction.git"
+python3 -m pip install --no-cache-dir "git+https://github.com/chickensavory/color-correction.git"
 ````
 
 ---
