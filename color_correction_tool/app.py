@@ -173,6 +173,7 @@ RAW_EXTS = {
     ".cr2",
     ".cr3",
     ".nef",
+    ".rw2",
 }
 IMG_EXTS = {
     ".jpg",

@@ -21,7 +21,7 @@ RAW_EXTS = {
     ".dng",
     ".cr2",
     ".cr3",
-    ".nef",
+    ".nef", ".rw2",
 }
 IMG_EXTS = {
     ".jpg",

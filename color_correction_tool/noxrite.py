@@ -17,7 +17,14 @@ try:
 except Exception:
     HAS_RAW = False
 
-RAW_EXTS = {".arw", ".dng", ".cr2", ".cr3", ".nef"}
+RAW_EXTS = {
+    ".arw",
+    ".dng",
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".rw2",
+}
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 ALL_EXTS = RAW_EXTS | IMG_EXTS
 
