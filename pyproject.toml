@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "color-correction"
-version = "0.1.1"
+version = "0.1.2"
 description = "CLI tool to automatically basic edit images"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [project.scripts]
-color-correction = "color_correction_tool.app:main"
+color-correction   = "color_correction_tool.app:main"
+color-correction-a = "color_correction_tool.contrast:main"
+color-correction-b = "color_correction_tool.noxrite:main"
+
 
 [tool.setuptools]
 include-package-data = true
