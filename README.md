@@ -1,39 +1,45 @@
 # color-correction
 
-This tool **automatically color-corrects and enhances image files** in a folder.  
+This tool **automatically color-corrects and enhances image files** in a folder.
 Everything below is meant to be **copy → paste → run** friendly (no admin needed).
 
-> **Command name:** This repo installs the command **`color-correction`**
+> **Command names:** This repo installs:
+>
+> * **`color-correction`** (default)
+> * **`color-correction-a`** (variation A)
+> * **`color-correction-b`** (variation B)
 
 ---
 
 ## What It Does
 
-When you run the command, it:
+When you run any of the commands, it:
 
-- Looks for a folder named **`input`**
-- Recursively scans for image files
-- Supports **JPEG / PNG** and **RAW formats** (ARW, DNG, CR2, CR3, NEF)
-- Automatically:
-  - Applies white balance
-  - Corrects exposure
-  - Lifts midtones
-  - Protects highlights
-  - Adjusts contrast and vibrance
-- Writes corrected images as **JPEGs** to an **`output/`** folder
-- Prints progress and stats in Terminal as it runs
+* Looks for a folder named **`input`** (unless you override `--input`)
+* Recursively scans for image files
+* Supports **JPEG / PNG** and **RAW formats** (ARW, DNG, CR2, CR3, NEF)
+* Automatically:
+
+  * Applies white balance
+  * Corrects exposure
+  * Lifts midtones
+  * Protects highlights
+  * Adjusts contrast and vibrance
+* Writes corrected images as **JPEGs** to an **`output/`** folder (unless you override `--output`)
+* Prints progress and stats in Terminal as it runs
 
 ---
 
 ## What You Need
 
-- macOS
-- **Python 3.9+**
+* macOS
+* **Python 3.9+**
 
 You do **not** need:
-- Admin/root access
-- Coding experience
-- Any extra apps
+
+* Admin/root access
+* Coding experience
+* Any extra apps
 
 ---
 
@@ -52,17 +58,19 @@ Press:
 ```bash
 python3 -m pip install --user --upgrade pip
 python3 -m pip install --no-cache-dir "git+https://github.com/chickensavory/color-correction.git"
-````
+```
 
 ---
 
 ### 3) Verify it installed
 
 ```bash
-color-correction
+color-correction --help
+color-correction-a --help
+color-correction-b --help
 ```
 
-If you see `command not found: color-correction`, do the one-time setup below.
+If you see `command not found`, do the one-time setup below.
 
 ---
 
@@ -91,7 +99,7 @@ hash -r
 Now try again:
 
 ```bash
-color-correction
+color-correction --help
 ```
 
 ---
@@ -128,8 +136,22 @@ The tool will scan **all subfolders automatically**.
 
 ### Step 4 — Run the tool
 
+Default pipeline:
+
 ```bash
 color-correction
+```
+
+Variation A:
+
+```bash
+color-correction-a
+```
+
+Variation B:
+
+```bash
+color-correction-b
 ```
 
 ---
@@ -150,19 +172,46 @@ You can override defaults if needed:
 ```bash
 color-correction \
   --input input \
-  --output output/fixed_ \
+  --output output \
   --quality 95 \
   --contrast 1.1 \
   --vibrance 0.2
 ```
 
+Works the same for variations:
+
+```bash
+color-correction-a --input input --output output_a
+color-correction-b --input input --output output_b
+```
+
 Common options:
 
+* `--input` → Input folder
+* `--output` → Output folder
 * `--quality` → JPEG quality (1–100)
 * `--contrast` → Contrast strength
 * `--vibrance` → Color vibrance
-* `--final-brightness` → Final brightness multiplier
-* `--use-opencv-wb` → Enable OpenCV white balance (mostly for JPEGs)
+* `--sharpness` → Unsharp-mask amount
+* `--pop` → Subject pop strength
+* `--microcontrast` → Subject microcontrast amount
+* `--micro-radius` → Microcontrast blur radius
+* `--shadows` → Shadows lift (0..1)
+* `--shadows-end` → Shadows fade-out luma
+* `--raw-auto-wb` → Use rawpy auto WB (instead of camera WB)
+* `--opencv-wb` → Enable OpenCV white balance
+* `--opencv-wb-mode` → `simple` or `grayworld`
+* `--no-bg-whiten` → Disable background whitening failsafe
+* `--bg-whiten-target` → Background whitening target
+* `--bg-whiten-max` → Max whitening gain
+* `--xrite-hint` → Filename hint for the xrite anchor image
+* `--no-skip-xrite-export` → Export xrite anchor output too
+* `--xrite-required` → Fail if xrite anchor is missing
+* `--wb-strength` → Anchor WB strength (0..1)
+* `--wb-sat-max` → Max saturation for neutral-pixel WB sampling
+* `--wb-y-min` → Min luma for neutral-pixel WB sampling
+* `--wb-y-max` → Max luma for neutral-pixel WB sampling
+* `--wb-min-pixels` → Minimum neutral pixels required
 
 Run this to see all options:
 
@@ -212,9 +261,8 @@ If RAW is unavailable, the tool will warn and skip RAW files.
 
 ## Notes
 
-* The tool expects an **`input/`** folder in the current directory
+* The tool expects an **`input/`** folder in the current directory unless `--input` is provided
 * Output is always written as **JPEG**
 * Originals are never modified
 * First run on new images? Keep a backup, just in case
 * Designed for fast, consistent product-style image correction
-
