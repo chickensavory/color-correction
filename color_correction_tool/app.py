@@ -173,9 +173,8 @@ RAW_EXTS = {
     ".cr2",
     ".cr3",
     ".nef",
-    ".rw2",
-    ".nef",
     ".crw",
+    ".rw2",
 }
 IMG_EXTS = {
     ".jpg",
@@ -242,24 +241,25 @@ class Config:
     jpeg_quality: int = 95
 
     raw_use_camera_wb: bool = True
-    raw_use_auto_wb: bool = True
+    raw_use_auto_wb: bool = False
     raw_no_auto_bright: bool = True
     raw_output_color_srgb: bool = True
     raw_highlight_mode: int = 1
+
     xrite_name_hint: str = "xrite"
     xrite_skip_export: bool = True
     xrite_required: bool = False
 
-    wb_sat_max: float = 0.20
-    wb_y_min: float = 0.10
+    wb_sat_max: float = 0.16
+    wb_y_min: float = 0.14
     wb_y_max: float = 0.95
     wb_max_channel: float = 0.995
     wb_min_pixels: int = 2500
 
     wb_gain_clip_min: float = 0.60
     wb_gain_clip_max: float = 1.70
-    wb_strength: float = 1.00
-    use_opencv_wb: bool = False
+    wb_strength: float = 0.85
+    use_opencv_wb: bool = True
     opencv_wb_mode: str = "simple"
     opencv_wb_p: float = 0.5
     opencv_wb_saturation_thresh: float = 0.98
@@ -287,7 +287,7 @@ class Config:
     bg_whiten_target: float = 0.992
     bg_whiten_gain_max: float = 2.25
 
-    shadows_lift: float = 0.32
+    shadows_lift: float = 0.18
     shadows_start: float = 0.00
     shadows_end: float = 0.52
     shadows_max_boost: float = 2.10
@@ -298,13 +298,13 @@ class Config:
     p_max: float = 3.00
     lift_strength: float = 0.85
 
-    pop_strength: float = 0.65
-    contrast_factor: float = 1.03
-    contrast_pivot: float = 0.62
-    microcontrast_amount: float = 0.12
-    microcontrast_radius: float = 10.0
+    pop_strength: float = 1.0
+    contrast_factor: float = 0.97
+    contrast_pivot: float = 0.58
+    microcontrast_amount: float = 0.50
+    microcontrast_radius: float = 6.0
 
-    vibrance: float = 0.08
+    vibrance: float = 0.90
     vibrance_max_boost: float = 1.12
     vibrance_highlight_start: float = 0.88
     vibrance_highlight_end: float = 0.99
@@ -313,7 +313,7 @@ class Config:
 
     highlight_protect_start: float = 0.88
     highlight_protect_end: float = 0.99
-    highlight_protect_strength: float = 0.80
+    highlight_protect_strength: float = 0.70
 
     highlight_roll_start: float = 0.92
     highlight_roll_strength: float = 0.55
@@ -323,10 +323,13 @@ class Config:
     highlight_detint_end: float = 0.995
     highlight_detint_strength: float = 0.65
 
-    sharpness_amount: float = 1.0
+    sharpness_amount: float = 1.8
     sharpness_radius: float = 1.0
     sharpness_threshold: int = 0
     final_brightness: float = 1.01
+
+    think_long_edge: int = 1600
+    think_min_edge: int = 640
 
 
 CFG = Config()
@@ -406,6 +409,47 @@ def _is_xrite_file(p: Path, cfg: Config) -> bool:
     return hint in p.name.lower()
 
 
+def _thinking_resize_bgr01(
+    bgr01: np.ndarray, cfg: Config
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    h, w = bgr01.shape[:2]
+    long_edge = max(h, w)
+    short_edge = min(h, w)
+
+    tgt_long = int(max(1, cfg.think_long_edge))
+    tgt_min = int(max(1, cfg.think_min_edge))
+
+    if long_edge <= tgt_long and short_edge <= tgt_min:
+        return bgr01, {"applied": False, "scale": 1.0, "size": (w, h)}
+
+    s1 = tgt_long / float(long_edge)
+    s2 = tgt_min / float(short_edge)
+    scale = max(s1, s2)
+
+    scale = min(scale, 1.0)
+
+    nh = max(1, int(round(h * scale)))
+    nw = max(1, int(round(w * scale)))
+
+    if nh == h and nw == w:
+        return bgr01, {"applied": False, "scale": 1.0, "size": (w, h)}
+
+    small = cv2.resize(bgr01, (nw, nh), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32), {
+        "applied": True,
+        "scale": float(scale),
+        "size": (nw, nh),
+        "orig": (w, h),
+    }
+
+
+def _upsample_mask_nn(mask_small: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
+    th, tw = target_hw
+    m8 = mask_small.astype(np.uint8) * 255
+    up = cv2.resize(m8, (tw, th), interpolation=cv2.INTER_NEAREST)
+    return up > 0
+
+
 def opencv_white_balance_bgr16(
     bgr16: np.ndarray, cfg: Config
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -453,7 +497,7 @@ def compute_anchor_wb_from_xrite_bgr16(
     bgr8 = float01_to_bgr8(bgr01)
     hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
     S = hsv[..., 1] / 255.0
-    Y = luma01_from_bgr01_srgb(bgr01)
+    Y = luma01_from_bgr01_linear(bgr01)
 
     mask = (
         (S <= float(cfg.wb_sat_max) * 1.5)
@@ -598,9 +642,9 @@ def compute_subject_mask(bg_mask: np.ndarray) -> np.ndarray:
     return subj_u8 > 0
 
 
-def apply_exposure_from_bg(
+def compute_exposure_gain_from_bg(
     bgr01: np.ndarray, bg_mask: np.ndarray, spec_mask: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> Dict[str, Any]:
     Y = luma01_from_bgr01_linear(bgr01)
 
     usable = bg_mask & (~spec_mask)
@@ -621,32 +665,29 @@ def apply_exposure_from_bg(
     gain = float(min(gain_target, gain_hi))
     gain = float(np.clip(gain, cfg.exp_gain_min, cfg.exp_gain_max))
 
-    out = apply_gain_linear_rgb(bgr01, gain)
-    return out, {"ref": ref, "base": base, "gain": gain}
+    return {"ref": ref, "base": base, "gain": gain}
 
 
-def bg_whiten_failsafe(
+def compute_bg_whiten_gain(
     bgr01: np.ndarray, bg_mask: np.ndarray, spec_mask: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> Dict[str, Any]:
     if not cfg.bg_whiten_enable:
-        return bgr01, {"applied": False}
+        return {"applied": True, "gain": 1.0}
 
     Y = luma01_from_bgr01_linear(bgr01)
     usable = bg_mask & (~spec_mask)
     if int(usable.sum()) < int(cfg.bg_min_pixels):
-        return bgr01, {"applied": False, "reason": "too_few_bg_pixels"}
+        return {"applied": False, "reason": "too_few_bg_pixels", "gain": 1.0}
 
     base = float(np.percentile(Y[usable], float(cfg.bg_whiten_pctl)))
     base = max(base, 1e-6)
 
     if base >= float(cfg.bg_whiten_target) - 1e-3:
-        return bgr01, {"applied": False, "base": base}
+        return {"applied": False, "base": base, "gain": 1.0}
 
     gain = float(cfg.bg_whiten_target) / base
     gain = float(np.clip(gain, 1.0, float(cfg.bg_whiten_gain_max)))
-
-    out = apply_gain_linear_rgb(bgr01, gain)
-    return out, {"applied": True, "base": base, "gain": gain}
+    return {"applied": True, "base": base, "gain": gain}
 
 
 def apply_shadows_lift(
@@ -895,10 +936,10 @@ def process_bgr16(
     bgr16_2, wb16_dbg = opencv_white_balance_bgr16(bgr16, cfg)
     dbg["wb_opencv"] = wb16_dbg
 
-    bgr01 = bgr16_to_float01(bgr16_2)
+    bgr01_full = bgr16_to_float01(bgr16_2)
 
     if anchor_wb_gains_rgb_lin is not None:
-        bgr01 = apply_anchor_wb_linear_rgb(bgr01, anchor_wb_gains_rgb_lin)
+        bgr01_full = apply_anchor_wb_linear_rgb(bgr01_full, anchor_wb_gains_rgb_lin)
         dbg["wb_anchor"] = {
             "applied": True,
             "gains_rgb_lin": anchor_wb_gains_rgb_lin.tolist(),
@@ -906,61 +947,80 @@ def process_bgr16(
     else:
         dbg["wb_anchor"] = {"applied": False, "reason": "no_anchor_gains"}
 
-    scene = detect_white_product_scene(bgr01)
+    bgr01_think, think_dbg = _thinking_resize_bgr01(bgr01_full, cfg)
+    dbg["thinking"] = think_dbg
+
+    scene = detect_white_product_scene(bgr01_think)
     dbg["scene"] = scene
 
-    bg_mask = compute_bg_mask(bgr01, cfg)
-    spec_mask = compute_specular_mask(bgr01, cfg)
+    bg_mask_t = compute_bg_mask(bgr01_think, cfg)
+    spec_mask_t = compute_specular_mask(bgr01_think, cfg)
 
-    pre_exposure_ref = bgr01.copy()
+    pre_exposure_ref_full = bgr01_full.copy()
 
-    bgr01, exp_dbg = apply_exposure_from_bg(bgr01, bg_mask, spec_mask, cfg)
+    exp_dbg = compute_exposure_gain_from_bg(bgr01_think, bg_mask_t, spec_mask_t, cfg)
+    bgr01_full = apply_gain_linear_rgb(bgr01_full, float(exp_dbg["gain"]))
     dbg["exposure_bg_linear"] = exp_dbg
+
+    bgr01_think = apply_gain_linear_rgb(bgr01_think, float(exp_dbg["gain"]))
 
     fb = float(cfg.final_brightness)
     if abs(fb - 1.0) > 1e-4:
-        bgr01 = apply_gain_linear_rgb(bgr01, fb)
+        bgr01_full = apply_gain_linear_rgb(bgr01_full, fb)
+        bgr01_think = apply_gain_linear_rgb(bgr01_think, fb)
         dbg["final_brightness"] = {"applied": True, "gain": fb}
     else:
         dbg["final_brightness"] = {"applied": False}
 
-    bg_mask2 = compute_bg_mask(bgr01, cfg)
-    spec_mask2 = compute_specular_mask(bgr01, cfg)
-    bgr01, wb_bg_dbg = bg_whiten_failsafe(bgr01, bg_mask2, spec_mask2, cfg)
+    bg_mask2_t = compute_bg_mask(bgr01_think, cfg)
+    spec_mask2_t = compute_specular_mask(bgr01_think, cfg)
+
+    wb_bg_dbg = compute_bg_whiten_gain(bgr01_think, bg_mask2_t, spec_mask2_t, cfg)
+    if float(wb_bg_dbg.get("gain", 1.0)) != 1.0:
+        g = float(wb_bg_dbg["gain"])
+        bgr01_full = apply_gain_linear_rgb(bgr01_full, g)
+        bgr01_think = apply_gain_linear_rgb(bgr01_think, g)
     dbg["bg_whiten_failsafe"] = wb_bg_dbg
 
-    bgr01, hp_dbg = highlight_protect_blend(pre_exposure_ref, bgr01, cfg)
+    bgr01_full, hp_dbg = highlight_protect_blend(pre_exposure_ref_full, bgr01_full, cfg)
     dbg["highlight_protect"] = hp_dbg
 
-    bg_mask3 = compute_bg_mask(bgr01, cfg)
-    spec_mask3 = compute_specular_mask(bgr01, cfg)
-    subj_mask = compute_subject_mask(bg_mask3)
+    bgr01_think, _ = _thinking_resize_bgr01(bgr01_full, cfg)
+
+    bg_mask3_t = compute_bg_mask(bgr01_think, cfg)
+    spec_mask3_t = compute_specular_mask(bgr01_think, cfg)
+    subj_mask_t = compute_subject_mask(bg_mask3_t)
+
+    subj_mask_full = _upsample_mask_nn(subj_mask_t, bgr01_full.shape[:2])
+    bg_mask_full = _upsample_mask_nn(bg_mask3_t, bgr01_full.shape[:2])
+    spec_mask_full = _upsample_mask_nn(spec_mask3_t, bgr01_full.shape[:2])
+
     dbg["mask_counts"] = {
-        "bg": int(bg_mask3.sum()),
-        "subj": int(subj_mask.sum()),
-        "spec": int(spec_mask3.sum()),
+        "bg": int(bg_mask_full.sum()),
+        "subj": int(subj_mask_full.sum()),
+        "spec": int(spec_mask_full.sum()),
     }
 
-    bgr01, sh_dbg = apply_shadows_lift(bgr01, cfg)
+    bgr01_full, sh_dbg = apply_shadows_lift(bgr01_full, cfg)
     dbg["shadows_lift"] = sh_dbg
 
-    bgr01, lift_dbg = adaptive_midtone_lift(bgr01, cfg, scene)
+    bgr01_full, lift_dbg = adaptive_midtone_lift(bgr01_full, cfg, scene)
     dbg["midtone_lift"] = lift_dbg
 
-    bgr01, v_dbg = apply_vibrance_ycrb_protected(bgr01, cfg)
+    bgr01_full, v_dbg = apply_vibrance_ycrb_protected(bgr01_full, cfg)
     dbg["vibrance_ycrcb"] = v_dbg
 
-    bgr01, c_dbg = apply_subject_contrast(bgr01, subj_mask, cfg)
-    bgr01, mc_dbg = apply_subject_microcontrast(bgr01, subj_mask, cfg)
+    bgr01_full, c_dbg = apply_subject_contrast(bgr01_full, subj_mask_full, cfg)
+    bgr01_full, mc_dbg = apply_subject_microcontrast(bgr01_full, subj_mask_full, cfg)
     dbg["subject_contrast"] = c_dbg
     dbg["subject_microcontrast"] = mc_dbg
 
-    bgr01, hr_dbg = highlight_rolloff(bgr01, cfg)
-    bgr01, hd_dbg = highlight_detint(bgr01, cfg)
+    bgr01_full, hr_dbg = highlight_rolloff(bgr01_full, cfg)
+    bgr01_full, hd_dbg = highlight_detint(bgr01_full, cfg)
     dbg["highlight_rolloff"] = hr_dbg
     dbg["highlight_detint"] = hd_dbg
 
-    bgr8 = float01_to_bgr8(bgr01)
+    bgr8 = float01_to_bgr8(bgr01_full)
     bgr8 = apply_unsharp_mask(bgr8, cfg)
     return bgr8, dbg
 
@@ -975,10 +1035,9 @@ def find_xrite_file(input_dir: Path, cfg: Config) -> Optional[Path]:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=str, default="input")
-    ap.add_argument("--output", type=str, default="output")
+    ap.add_argument("--input", type=str, default="input_/hidden")
+    ap.add_argument("--output", type=str, default="output/cr2_test")
     ap.add_argument("--quality", type=int, default=CFG.jpeg_quality)
-    ap.add_argument("--raw-auto-wb", action="store_true")
     ap.add_argument("--sharpness", type=float, default=CFG.sharpness_amount)
     ap.add_argument("--vibrance", type=float, default=CFG.vibrance)
 
@@ -1012,6 +1071,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bg-whiten-target", type=float, default=CFG.bg_whiten_target)
     ap.add_argument("--bg-whiten-max", type=float, default=CFG.bg_whiten_gain_max)
 
+    ap.add_argument(
+        "--think-long-edge",
+        type=int,
+        default=CFG.think_long_edge,
+        help="Compute masks/percentiles at this long-edge size (edits still full-res).",
+    )
+    ap.add_argument(
+        "--think-min-edge",
+        type=int,
+        default=CFG.think_min_edge,
+        help="Minimum short-edge size for thinking resize (prevents too-tiny masks).",
+    )
+
     return ap.parse_args()
 
 
@@ -1028,7 +1100,6 @@ def main() -> None:
     cfg = Config()
     cfg.jpeg_quality = int(args.quality)
 
-    cfg.raw_use_auto_wb = bool(args.raw_auto_wb)
     cfg.raw_use_camera_wb = not cfg.raw_use_auto_wb
 
     cfg.sharpness_amount = float(args.sharpness)
@@ -1059,6 +1130,9 @@ def main() -> None:
     cfg.bg_whiten_enable = not bool(args.no_bg_whiten)
     cfg.bg_whiten_target = float(np.clip(args.bg_whiten_target, 0.0, 1.0))
     cfg.bg_whiten_gain_max = float(max(1.0, args.bg_whiten_max))
+
+    cfg.think_long_edge = int(max(256, args.think_long_edge))
+    cfg.think_min_edge = int(max(256, args.think_min_edge))
 
     ensure_dir(output_dir)
 
@@ -1102,7 +1176,8 @@ def main() -> None:
         f"Micro={cfg.microcontrast_amount}@{cfg.microcontrast_radius} | "
         f"Vibrance={cfg.vibrance} | Shadows={cfg.shadows_lift} | "
         f"AnchorWB={'on' if anchor_wb is not None else 'off'} | "
-        f"BGWhiten={'on' if cfg.bg_whiten_enable else 'off'}"
+        f"BGWhiten={'on' if cfg.bg_whiten_enable else 'off'} | "
+        f"ThinkLongEdge={cfg.think_long_edge} (min {cfg.think_min_edge})"
     )
 
     for p in iter_images(input_dir):
@@ -1127,12 +1202,14 @@ def main() -> None:
         wb_bg = dbg.get("bg_whiten_failsafe", {})
         c = dbg.get("subject_contrast", {})
         mc = dbg.get("subject_microcontrast", {})
+        think = dbg.get("thinking", {})
         print(
             f"Saved: {output_dir.name} | "
             f"ExpGain={exp.get('gain',0):.2f}({exp.get('ref', '?')})"
             f"BGWhiten={('on' if wb_bg.get('applied') else 'off')} "
             f"SubContrast={('on' if c.get('applied') else 'off')} "
             f"Micro={('on' if mc.get('applied') else 'off')}"
+            f"ThinkScale={think.get('scale', 1.0):.3f}"
         )
 
     total = time.perf_counter() - t0
