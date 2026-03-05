@@ -1035,8 +1035,8 @@ def find_xrite_file(input_dir: Path, cfg: Config) -> Optional[Path]:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=str, default="input_/hidden")
-    ap.add_argument("--output", type=str, default="output/cr2_test")
+    ap.add_argument("--input", type=str, default="input")
+    ap.add_argument("--output", type=str, default="output")
     ap.add_argument("--quality", type=int, default=CFG.jpeg_quality)
     ap.add_argument("--sharpness", type=float, default=CFG.sharpness_amount)
     ap.add_argument("--vibrance", type=float, default=CFG.vibrance)
