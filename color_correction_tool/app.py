@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Dict, Any
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import time
 
 from color_correction_tool.xmp import write_processed_tags
@@ -167,6 +168,12 @@ def _post_run_counts(
         print(f"[TRACK] FAILED: {type(e).__name__}: {e}")
 
 
+try:
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(4)
+except Exception:
+    pass
+
 RAW_EXTS = {
     ".arw",
     ".dng",
@@ -186,54 +193,121 @@ ALL_EXTS = RAW_EXTS | IMG_EXTS
 PROCESS_TOOL = "color-correction"
 
 
+_N = 65536
+
+
+def _ensure_contiguous(arr: np.ndarray) -> np.ndarray:
+    if not arr.flags["C_CONTIGUOUS"]:
+        return np.ascontiguousarray(arr)
+    return arr
+
+
+_LUMA_KERNEL_BGR = np.array([[0.0722, 0.7152, 0.2126]], dtype=np.float32)
+
+
+_M_BGR2YCrCb = np.array(
+    [
+        [0.114, 0.587, 0.299, 0.0],
+        [-0.08131, -0.41869, 0.5, 0.5],
+        [0.5, -0.33126, -0.16874, 0.5],
+    ],
+    dtype=np.float32,
+)
+
+_M_YCrCb2BGR = np.array(
+    [
+        [1.0, 0.0, 1.772, -0.886],
+        [1.0, -0.714136, -0.344136, 0.529136],
+        [1.0, 1.402, 0.0, -0.701],
+    ],
+    dtype=np.float32,
+)
+
+
 def srgb_to_linear(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x, 0.0, 1.0).astype(np.float32)
+    x = np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
     a = 0.055
     return np.where(x <= 0.04045, x / 12.92, ((x + a) / (1.0 + a)) ** 2.4).astype(
-        np.float32
+        np.float32, copy=False
     )
 
 
 def linear_to_srgb(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x, 0.0, 1.0).astype(np.float32)
+    x = np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
     a = 0.055
     return np.where(
         x <= 0.0031308, x * 12.92, (1.0 + a) * (x ** (1.0 / 2.4)) - a
-    ).astype(np.float32)
+    ).astype(np.float32, copy=False)
 
 
 def bgr16_to_float01(bgr16: np.ndarray) -> np.ndarray:
-    return np.clip(bgr16.astype(np.float32) / 65535.0, 0.0, 1.0)
+    return np.clip(bgr16.astype(np.float32) / 65535.0, 0.0, 1.0).astype(
+        np.float32, copy=False
+    )
 
 
 def float01_to_bgr8(bgr01: np.ndarray) -> np.ndarray:
-    return np.clip(bgr01 * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    out = np.empty(bgr01.shape, dtype=np.float32)
+    np.multiply(bgr01, 255.0, out=out)
+    np.add(out, 0.5, out=out)
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
 
 
 def luma01_from_bgr01_srgb(bgr01: np.ndarray) -> np.ndarray:
-    return 0.2126 * bgr01[..., 2] + 0.7152 * bgr01[..., 1] + 0.0722 * bgr01[..., 0]
+    bgr01 = _ensure_contiguous(bgr01.astype(np.float32, copy=False))
+    return (
+        cv2.transform(bgr01, _LUMA_KERNEL_BGR)
+        .reshape(bgr01.shape[:2])
+        .astype(np.float32, copy=False)
+    )
 
 
 def luma01_from_bgr01_linear(bgr01: np.ndarray) -> np.ndarray:
-    rgb = bgr01[..., ::-1].astype(np.float32)
-    rgb_lin = srgb_to_linear(rgb)
+    bgr_lin = srgb_to_linear(bgr01)
+    bgr_lin = _ensure_contiguous(bgr_lin)
     return (
-        0.2126 * rgb_lin[..., 0] + 0.7152 * rgb_lin[..., 1] + 0.0722 * rgb_lin[..., 2]
-    ).astype(np.float32)
+        cv2.transform(bgr_lin, _LUMA_KERNEL_BGR)
+        .reshape(bgr_lin.shape[:2])
+        .astype(np.float32, copy=False)
+    )
 
 
 def smoothstep(x: np.ndarray, edge0: float, edge1: float) -> np.ndarray:
     t = np.clip((x - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
+    result = t * t
+    np.multiply(result, 3.0 - 2.0 * t, out=result)
+    return result.astype(np.float32, copy=False)
 
 
-def apply_gain_linear_rgb(bgr01: np.ndarray, gain: float) -> np.ndarray:
-    rgb = bgr01[..., ::-1].astype(np.float32)
-    rgb_lin = srgb_to_linear(rgb)
-    rgb_lin = np.clip(rgb_lin * float(gain), 0.0, 1.0)
-    rgb_srgb = linear_to_srgb(rgb_lin)
-    out = rgb_srgb[..., ::-1].copy()
-    return np.clip(out, 0.0, 1.0)
+def apply_gain_linear_bgr(bgr01: np.ndarray, gain: float) -> np.ndarray:
+    t = np.linspace(0.0, 1.0, _N, dtype=np.float64)
+    a = 0.055
+    t_lin = np.where(t <= 0.04045, t / 12.92, ((t + a) / (1.0 + a)) ** 2.4)
+    t_lin = np.clip(t_lin * float(gain), 0.0, 1.0)
+    t_out = np.where(
+        t_lin <= 0.0031308, t_lin * 12.92, (1.0 + a) * (t_lin ** (1.0 / 2.4)) - a
+    )
+    lut = np.clip(t_out, 0.0, 1.0).astype(np.float32)
+    idx = np.clip(bgr01 * np.float32(_N - 1) + np.float32(0.5), 0, _N - 1).astype(
+        np.uint16
+    )
+    return lut[idx]
+
+
+def _apply_y_ratio_lut(
+    bgr01: np.ndarray,
+    Y: np.ndarray,
+    ratio_lut: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    idx = np.clip(Y * np.float32(_N - 1) + np.float32(0.5), 0, _N - 1).astype(np.uint16)
+    ratio = ratio_lut[idx]
+    if mask is not None:
+        ratio = np.where(mask, ratio, np.float32(1.0))
+    out = bgr01 * ratio[..., None]
+    np.clip(out, 0.0, 1.0, out=out)
+    return out
 
 
 @dataclass
@@ -352,7 +426,7 @@ def read_jpeg_like_to_bgr16(path: Path) -> Optional[np.ndarray]:
             im = im.convert("RGB")
             rgb8 = np.array(im, dtype=np.uint8)
         bgr8 = cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
-        return bgr8.astype(np.uint16) * 257
+        return (bgr8.astype(np.uint16) * 257).astype(np.uint16, copy=False)
     except Exception as e:
         print(f"[WARN] PIL read failed {path}: {e}")
         return None
@@ -409,9 +483,7 @@ def _is_xrite_file(p: Path, cfg: Config) -> bool:
     return hint in p.name.lower()
 
 
-def _thinking_resize_bgr01(
-    bgr01: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+def _thinking_resize_bgr01(bgr01, cfg):
     h, w = bgr01.shape[:2]
     long_edge = max(h, w)
     short_edge = min(h, w)
@@ -421,13 +493,7 @@ def _thinking_resize_bgr01(
 
     if long_edge <= tgt_long and short_edge <= tgt_min:
         return bgr01, {"applied": False, "scale": 1.0, "size": (w, h)}
-
-    s1 = tgt_long / float(long_edge)
-    s2 = tgt_min / float(short_edge)
-    scale = max(s1, s2)
-
-    scale = min(scale, 1.0)
-
+    scale = min(max(tgt_long / float(long_edge), tgt_min / float(short_edge)), 1.0)
     nh = max(1, int(round(h * scale)))
     nw = max(1, int(round(w * scale)))
 
@@ -435,7 +501,9 @@ def _thinking_resize_bgr01(
         return bgr01, {"applied": False, "scale": 1.0, "size": (w, h)}
 
     small = cv2.resize(bgr01, (nw, nh), interpolation=cv2.INTER_AREA)
-    return small.astype(np.float32), {
+    if small.dtype != np.float32:
+        small = small.astype(np.float32, copy=False)
+    return small, {
         "applied": True,
         "scale": float(scale),
         "size": (nw, nh),
@@ -443,16 +511,15 @@ def _thinking_resize_bgr01(
     }
 
 
-def _upsample_mask_nn(mask_small: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
+def _upsample_mask_nn(mask_small, target_hw):
     th, tw = target_hw
-    m8 = mask_small.astype(np.uint8) * 255
-    up = cv2.resize(m8, (tw, th), interpolation=cv2.INTER_NEAREST)
+    up = cv2.resize(
+        mask_small.astype(np.uint8) * 255, (tw, th), interpolation=cv2.INTER_NEAREST
+    )
     return up > 0
 
 
-def opencv_white_balance_bgr16(
-    bgr16: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+def opencv_white_balance_bgr16(bgr16, cfg):
     if not cfg.use_opencv_wb:
         return bgr16, {"applied": False, "reason": "disabled"}
     if not hasattr(cv2, "xphoto"):
@@ -479,9 +546,11 @@ def opencv_white_balance_bgr16(
         src_med = np.median(bgr8[mask].reshape(-1, 3), axis=0).astype(np.float32) + 1e-6
         dst_med = np.median(wb8[mask].reshape(-1, 3), axis=0).astype(np.float32)
 
-        gains = (dst_med / src_med).astype(np.float32)
-        gains = np.clip(gains, cfg.wb_gain_clip_min, cfg.wb_gain_clip_max)
-
+        gains = np.clip(
+            (dst_med / src_med).astype(np.float32),
+            cfg.wb_gain_clip_min,
+            cfg.wb_gain_clip_max,
+        )
         out16 = np.clip(
             bgr16.astype(np.float32) * gains[None, None, :], 0.0, 65535.0
         ).astype(np.uint16)
@@ -490,9 +559,7 @@ def opencv_white_balance_bgr16(
         return bgr16, {"applied": False, "reason": f"wb_failed: {e}"}
 
 
-def compute_anchor_wb_from_xrite_bgr16(
-    bgr16: np.ndarray, cfg: Config
-) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+def compute_anchor_wb_from_xrite_bgr16(bgr16, cfg):
     bgr01 = bgr16_to_float01(bgr16)
     bgr8 = float01_to_bgr8(bgr01)
     hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -507,66 +574,55 @@ def compute_anchor_wb_from_xrite_bgr16(
     n = int(mask.sum())
 
     if n < 500:
-        return None, {
-            "ok": False,
-            "reason": "too_few_neutral_pixels",
-            "n": n,
-        }
-
-    rgb01 = bgr01[..., ::-1].astype(np.float32)
-    rgb_lin = srgb_to_linear(rgb01)
-
-    samp = rgb_lin[mask].reshape(-1, 3).astype(np.float32)
-    med = np.median(samp, axis=0).astype(np.float32) + 1e-8
-
-    tgt = float(np.mean(med))
-    gains = (tgt / med).astype(np.float32)
-    gains = np.clip(gains, cfg.wb_gain_clip_min, cfg.wb_gain_clip_max)
-
+        return None, {"ok": False, "reason": "too_few_neutrals_pixels", "n": n}
+    bgr_lin = srgb_to_linear(bgr01)
+    med_bgr = np.median(bgr_lin[mask].reshape(-1, 3), axis=0).astype(np.float32) + 1e-8
+    med_rgb = med_bgr[::-1].copy()
+    tgt = float(np.mean(med_rgb))
+    gains_rgb = np.clip(
+        (tgt / med_rgb).astype(np.float32), cfg.wb_gain_clip_min, cfg.wb_gain_clip_max
+    )
     a = float(np.clip(cfg.wb_strength, 0.0, 1.0))
-    gains = 1.0 + a * (gains - 1.0)
-
-    return gains, {
+    gains_rgb = 1.0 + a * (gains_rgb - 1.0)
+    return gains_rgb, {
         "ok": True,
         "n": n,
-        "rgb_lin_median": med.tolist(),
-        "wb_gains_rgb_lin": gains.tolist(),
+        "rgb_lin_median": med_rgb.tolist(),
+        "wb_gains_rgb_lin": gains_rgb.tolist(),
         "strength": a,
     }
 
 
-def apply_anchor_wb_linear_rgb(
-    bgr01: np.ndarray, wb_gains_rgb_lin: np.ndarray
-) -> np.ndarray:
-    rgb = bgr01[..., ::-1].astype(np.float32)
-    rgb_lin = srgb_to_linear(rgb)
-    rgb_lin = np.clip(rgb_lin * wb_gains_rgb_lin[None, None, :], 0.0, 1.0)
-    rgb_srgb = linear_to_srgb(rgb_lin)
-    out_bgr = rgb_srgb[..., ::-1].copy()
-    return np.clip(out_bgr, 0.0, 1.0)
+def apply_anchor_wb_linear_rgb(bgr01, wb_gains_rgb_lin):
+    bgr01 = bgr01.astype(np.float32, copy=False)
+    bgr_lin = srgb_to_linear(bgr01)
+    gains_bgr = np.array(
+        [wb_gains_rgb_lin[2], wb_gains_rgb_lin[1], wb_gains_rgb_lin[0]],
+        dtype=np.float32,
+    )
+    bgr_lin = np.clip(bgr_lin * gains_bgr[None, None, :], 0.0, 1.0)
+    return np.clip(linear_to_srgb(bgr_lin), 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def detect_white_product_scene(bgr01: np.ndarray) -> Dict[str, Any]:
+def detect_white_product_scene(bgr01, bgr8=None):
     Y = luma01_from_bgr01_srgb(bgr01)
     y_med = float(np.median(Y))
     y_p95 = float(np.percentile(Y, 95.0))
 
-    is_dark_subject = y_med < 0.25
-
-    bgr8 = float01_to_bgr8(bgr01)
+    if bgr8 is None:
+        bgr8 = float01_to_bgr8(bgr01)
     hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
     s_med = float(np.median(hsv[..., 1] / 255.0))
-    is_whiteish = (s_med < 0.10) and (y_p95 > 0.88)
 
     return {
-        "is_whiteish": bool(is_whiteish),
-        "is_dark_subject": bool(is_dark_subject),
+        "is_whiteish": (s_med < 0.10) and (y_p95 > 0.88),
+        "is_dark_subject": y_med < 0.25,
         "s_med": s_med,
         "y_med": y_med,
     }
 
 
-def _border_mask(h: int, w: int, frac: float) -> np.ndarray:
+def _border_mask(h, w, frac):
     b = int(max(1, round(min(h, w) * float(frac))))
     m = np.zeros((h, w), dtype=bool)
     m[:b, :] = True
@@ -576,9 +632,9 @@ def _border_mask(h: int, w: int, frac: float) -> np.ndarray:
     return m
 
 
-def compute_bg_mask(bgr01: np.ndarray, cfg: Config) -> np.ndarray:
-    bgr8 = float01_to_bgr8(bgr01)
-    hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
+def compute_bg_mask(bgr01, cfg, hsv=None):
+    if hsv is None:
+        hsv = cv2.cvtColor(float01_to_bgr8(bgr01), cv2.COLOR_BGR2HSV).astype(np.float32)
     S = hsv[..., 1] / 255.0
     V = hsv[..., 2] / 255.0
 
@@ -589,16 +645,9 @@ def compute_bg_mask(bgr01: np.ndarray, cfg: Config) -> np.ndarray:
     if int(bg.sum()) < int(cfg.min_bg_for_border):
         h, w = bg.shape
         bm = _border_mask(h, w, float(cfg.border_frac))
-        s_border = S[bm]
-        v_border = V[bm]
-
-        s_p35 = float(np.percentile(s_border, 35.0))
-        v_p65 = float(np.percentile(v_border, 65.0))
-
-        s_thr2 = min(s_thr, max(0.10, s_p35))
-        v_thr2 = max(v_thr, min(0.92, v_p65))
-
-        bg2 = (V >= v_thr2) & (S <= s_thr2)
+        s_p35 = float(np.percentile(S[bm], 35.0))
+        v_p65 = float(np.percentile(V[bm], 65.0))
+        bg2 = (V >= max(v_thr, min(0.92, v_p65))) & (S <= min(s_thr, max(0.10, s_p35)))
         if int(bg2.sum()) > int(bg.sum()):
             bg = bg2
 
@@ -609,18 +658,18 @@ def compute_bg_mask(bgr01: np.ndarray, cfg: Config) -> np.ndarray:
     return bg_u8 > 0
 
 
-def compute_specular_mask(bgr01: np.ndarray, cfg: Config) -> np.ndarray:
-    bgr8 = float01_to_bgr8(bgr01)
-    hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
+def compute_specular_mask(bgr01, cfg, hsv=None, Ylin=None):
+    if hsv is None:
+        hsv = cv2.cvtColor(float01_to_bgr8(bgr01), cv2.COLOR_BGR2HSV).astype(np.float32)
     S = hsv[..., 1] / 255.0
     V = hsv[..., 2] / 255.0
 
-    Y = luma01_from_bgr01_linear(bgr01)
-    gx = cv2.Sobel(Y, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(Y, cv2.CV_32F, 0, 1, ksize=3)
-    g = np.sqrt(gx * gx + gy * gy)
-    g = np.clip(g, 0.0, 1.0)
-
+    if Ylin is None:
+        Ylin = luma01_from_bgr01_linear(bgr01)
+    gx = cv2.Sobel(Ylin, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(Ylin, cv2.CV_32F, 0, 1, ksize=3)
+    g = cv2.magnitude(gx, gy)
+    np.clip(g, 0.0, 1.0, out=g)
     spec = (
         (V >= float(cfg.spec_v_min))
         & (S <= float(cfg.spec_s_max))
@@ -629,48 +678,38 @@ def compute_specular_mask(bgr01: np.ndarray, cfg: Config) -> np.ndarray:
 
     spec_u8 = spec.astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    spec_u8 = cv2.dilate(spec_u8, k, iterations=1)
-    return spec_u8 > 0
+    return cv2.dilate(spec_u8, k, iterations=1) > 0
 
 
-def compute_subject_mask(bg_mask: np.ndarray) -> np.ndarray:
-    subj = ~bg_mask
-    subj_u8 = subj.astype(np.uint8) * 255
+def compute_subject_mask(bg_mask):
+    subj_u8 = (~bg_mask).astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     subj_u8 = cv2.morphologyEx(subj_u8, cv2.MORPH_CLOSE, k, iterations=2)
     subj_u8 = cv2.morphologyEx(subj_u8, cv2.MORPH_OPEN, k, iterations=1)
     return subj_u8 > 0
 
 
-def compute_exposure_gain_from_bg(
-    bgr01: np.ndarray, bg_mask: np.ndarray, spec_mask: np.ndarray, cfg: Config
-) -> Dict[str, Any]:
+def compute_exposure_gain_from_bg(bgr01, bg_mask, spec_mask, cfg):
     Y = luma01_from_bgr01_linear(bgr01)
-
     usable = bg_mask & (~spec_mask)
     if int(usable.sum()) < int(cfg.bg_min_pixels):
         usable = np.ones_like(bg_mask, dtype=bool)
         ref = "all"
     else:
         ref = "bg"
-
-    base = float(np.percentile(Y[usable], float(cfg.exp_pctl)))
-    base = max(base, 1e-6)
-    gain_target = float(cfg.exp_target) / base
-
-    hi = float(np.percentile(Y[usable], float(cfg.exp_highlight_pctl)))
-    hi = max(hi, 1e-6)
-    gain_hi = float(cfg.exp_highlight_cap) / hi
-
-    gain = float(min(gain_target, gain_hi))
-    gain = float(np.clip(gain, cfg.exp_gain_min, cfg.exp_gain_max))
-
+    base = max(float(np.percentile(Y[usable], float(cfg.exp_pctl))), 1e-6)
+    hi = max(float(np.percentile(Y[usable], float(cfg.exp_highlight_pctl))), 1e-6)
+    gain = float(
+        np.clip(
+            min(float(cfg.exp_target) / base, float(cfg.exp_highlight_cap) / hi),
+            cfg.exp_gain_min,
+            cfg.exp_gain_max,
+        )
+    )
     return {"ref": ref, "base": base, "gain": gain}
 
 
-def compute_bg_whiten_gain(
-    bgr01: np.ndarray, bg_mask: np.ndarray, spec_mask: np.ndarray, cfg: Config
-) -> Dict[str, Any]:
+def compute_bg_whiten_gain(bgr01, bg_mask, spec_mask, cfg):
     if not cfg.bg_whiten_enable:
         return {"applied": True, "gain": 1.0}
 
@@ -679,265 +718,254 @@ def compute_bg_whiten_gain(
     if int(usable.sum()) < int(cfg.bg_min_pixels):
         return {"applied": False, "reason": "too_few_bg_pixels", "gain": 1.0}
 
-    base = float(np.percentile(Y[usable], float(cfg.bg_whiten_pctl)))
-    base = max(base, 1e-6)
-
+    base = max(float(np.percentile(Y[usable], float(cfg.bg_whiten_pctl))), 1e-6)
     if base >= float(cfg.bg_whiten_target) - 1e-3:
         return {"applied": False, "base": base, "gain": 1.0}
 
-    gain = float(cfg.bg_whiten_target) / base
-    gain = float(np.clip(gain, 1.0, float(cfg.bg_whiten_gain_max)))
+    gain = float(
+        np.clip(float(cfg.bg_whiten_target) / base, 1.0, float(cfg.bg_whiten_gain_max))
+    )
     return {"applied": True, "base": base, "gain": gain}
 
 
-def apply_shadows_lift(
-    bgr01: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    strength = float(np.clip(cfg.shadows_lift, 0.0, 1.0))
-    if strength <= 1e-6:
-        return bgr01, {"applied": False}
-
-    Y = luma01_from_bgr01_srgb(bgr01)
-    s0 = float(np.clip(cfg.shadows_start, 0.0, 0.95))
-    s1 = float(np.clip(cfg.shadows_end, s0 + 1e-3, 1.0))
-
-    w = 1.0 - smoothstep(Y, s0, s1)
-    w *= strength
-
-    gamma = 1.0 / (1.0 + 1.8 * strength)
-    Y_lift = np.power(np.clip(Y, 0.0, 1.0), gamma)
-
-    ratio = Y_lift / np.maximum(Y, 1e-4)
-    ratio = np.clip(ratio, 1.0, float(cfg.shadows_max_boost)).astype(np.float32)
-
-    out = np.clip(bgr01 * (1.0 + w[..., None] * (ratio[..., None] - 1.0)), 0.0, 1.0)
-    return out, {
-        "applied": True,
-        "strength": strength,
-        "gamma": gamma,
-        "end": s1,
-    }
-
-
-def adaptive_midtone_lift(
+def apply_shadows_and_midtone_fused(
     bgr01: np.ndarray, cfg: Config, scene_info: Dict
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     Y = luma01_from_bgr01_srgb(bgr01)
+    yv = np.linspace(0.0, 1.0, _N, dtype=np.float64)
+
+    strength = float(np.clip(cfg.shadows_lift, 0.0, 1.0))
+    sh_mult = np.ones(_N, dtype=np.float64)
+    sh_dbg = {"applied": False}
+    if strength > 1e-6:
+        s0 = float(np.clip(cfg.shadows_start, 0.0, 0.95))
+        s1 = float(np.clip(cfg.shadows_end, s0 + 1e-3, 1.0))
+        gamma = 1.0 / (1.0 + 1.8 * strength)
+        t = np.clip((yv - s0) / max(s1 - s0, 1e-6), 0.0, 1.0)
+        w = (1.0 - t * t * (3.0 - 2.0 * t)) * strength
+        y_lift = np.power(np.clip(yv, 0.0, 1.0), gamma)
+        ratio = np.clip(
+            y_lift / np.maximum(yv, 1e-4), 1.0, float(cfg.shadows_max_boost)
+        )
+        sh_mult = 1.0 + w * (ratio - 1.0)
+        sh_dbg = {"applied": True, "strength": strength, "gamma": gamma, "end": s1}
+
+    y_after_sh = np.clip(yv * sh_mult, 0.0, 1.0)
 
     subj_mask = Y < cfg.subject_white_cut
     if int(subj_mask.sum()) < 2000:
         subj_mask = np.ones(Y.shape, dtype=bool)
 
-    med = float(np.median(Y[subj_mask]))
+    med = min(max(float(np.median(Y[subj_mask])), 1e-6), 0.999999)
     tgt = float(cfg.midtone_target)
-
     is_dark_scene = False
     if med < 0.25:
         is_dark_scene = True
-        tgt = max(med * 2.5, 0.40)
-        tgt = min(tgt, cfg.midtone_target)
-    med = min(max(med, 1e-6), 0.999999)
-
-    one_minus_med = max(1.0 - med, 1e-6)
-    one_minus_tgt = max(1.0 - tgt, 1e-6)
-
-    p = float(np.log(one_minus_tgt) / np.log(one_minus_med))
-    p = float(np.clip(p, cfg.p_min, cfg.p_max))
-
-    Yp = 1.0 - np.power(np.clip(1.0 - Y, 0.0, 1.0), p)
-    scale = Yp / np.maximum(Y, 1e-4)
-    scale = np.clip(scale, 0.75, 2.2).astype(np.float32)
-
-    lifted = np.clip(bgr01 * scale[..., None], 0.0, 1.0)
+        tgt = min(max(med * 2.5, 0.40), cfg.midtone_target)
+    p = float(
+        np.clip(
+            np.log(max(1.0 - tgt, 1e-6)) / np.log(max(1.0 - med, 1e-6)),
+            cfg.p_min,
+            cfg.p_max,
+        )
+    )
     a = float(np.clip(cfg.lift_strength, 0.0, 1.0))
     if scene_info.get("is_whiteish", False):
         a *= 0.75
 
-    out = np.clip(bgr01 * (1.0 - a) + lifted * a, 0.0, 1.0)
+    Yp = 1.0 - np.power(np.clip(1.0 - y_after_sh, 0.0, 1.0), p)
+    scale = np.clip(Yp / np.maximum(y_after_sh, 1e-4), 0.75, 2.2)
+    mt_mult = 1.0 + a * (scale - 1.0)
+
+    combined = (sh_mult * mt_mult).astype(np.float32)
+
+    out = _apply_y_ratio_lut(bgr01, Y, combined)
     return out, {
-        "applied": True,
-        "subject_median": med,
-        "target": tgt,
-        "is_dark_fix": is_dark_scene,
-        "p": p,
+        "shadows": sh_dbg,
+        "midtone": {
+            "applied": True,
+            "subject_median": med,
+            "target": tgt,
+            "is_dark_fix": is_dark_scene,
+            "p": p,
+        },
     }
 
 
-def highlight_protect_blend(original: np.ndarray, edited: np.ndarray, cfg: Config):
-    Yo = luma01_from_bgr01_srgb(original)
-    w = smoothstep(Yo, cfg.highlight_protect_start, cfg.highlight_protect_end)
-    strength = float(np.clip(cfg.highlight_protect_strength, 0.0, 1.0))
-    w = w * strength
-    out = np.clip(edited * (1.0 - w[..., None]) + original * w[..., None], 0.0, 1.0)
-    return out, {"applied": True}
+def highlight_protect_blend(original, edited, cfg, Y_original=None):
+    if Y_original is None:
+        Y_original = luma01_from_bgr01_srgb(original)
+    w = smoothstep(Y_original, cfg.highlight_protect_start, cfg.highlight_protect_end)
+    w *= float(np.clip(cfg.highlight_protect_strength, 0.0, 1.0))
+    diff = np.subtract(original, edited)
+    np.multiply(diff, w[..., None], out=diff)
+    np.add(edited, diff, out=diff)
+    np.clip(diff, 0.0, 1.0, out=diff)
+    return diff.astype(np.float32, copy=False), {"applied": True}
 
 
-def highlight_rolloff(
-    bgr01: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    strength = float(np.clip(cfg.highlight_roll_strength, 0.0, 1.0))
-    start = float(np.clip(cfg.highlight_roll_start, 0.0, 0.999))
-    if strength <= 1e-6:
-        return bgr01, {"applied": False}
+def highlight_roll_and_detint(bgr01, cfg):
+    Y = luma01_from_bgr01_srgb(bgr01)
+    hr_dbg = {"applied": False}
+    hd_dbg = {"applied": False}
+
+    strength_r = float(np.clip(cfg.highlight_roll_strength, 0.0, 1.0))
+    start_r = float(np.clip(cfg.highlight_roll_start, 0.0, 0.999))
+    if strength_r > 1e-6:
+        yv = np.linspace(0.0, 1.0, _N, dtype=np.float64)
+        t = np.clip((yv - start_r) / max(1.0 - start_r, 1e-6), 0.0, 1.0)
+        Y2 = np.clip(yv - strength_r * (t * t) * (yv - start_r), 0.0, 1.0)
+        ratio = np.clip(Y2 / np.maximum(yv, 1e-4), 0.80, 1.0).astype(np.float32)
+        bgr01 = _apply_y_ratio_lut(bgr01, Y, ratio)
+        idx = np.clip(Y * np.float32(_N - 1) + np.float32(0.5), 0, _N - 1).astype(
+            np.uint16
+        )
+        Y = np.clip(Y * ratio[idx], 0.0, 1.0)
+        hr_dbg = {"applied": True}
+
+    if cfg.highlight_detint_enable:
+        w = smoothstep(
+            Y, float(cfg.highlight_detint_start), float(cfg.highlight_detint_end)
+        )
+        a = float(np.clip(cfg.highlight_detint_strength, 0.0, 1.0))
+        w *= a
+        if float(w.max()) > 1e-6:
+            m = np.max(bgr01, axis=2, keepdims=True)
+            w3 = w[..., None]
+            diff = np.subtract(m, bgr01)
+            np.multiply(diff, w3, out=diff)
+            np.add(bgr01, diff, out=diff)
+            np.clip(diff, 0.0, 1.0, out=diff)
+            bgr01 = diff.astype(np.float32, copy=False)
+            hd_dbg = {"applied": True}
+
+    return bgr01, hr_dbg, hd_dbg
+
+
+def apply_subject_pop(bgr01, subject_mask, cfg):
+    pop = float(np.clip(cfg.pop_strength, 0.0, 1.0))
+    c_dbg = {"applied": False}
+    mc_dbg = {"applied": False}
+    if pop <= 1e-6:
+        return bgr01, c_dbg, mc_dbg
 
     Y = luma01_from_bgr01_srgb(bgr01)
-    t = np.clip((Y - start) / max(1.0 - start, 1e-6), 0.0, 1.0)
 
-    Y2 = Y - strength * (t * t) * (Y - start)
-    Y2 = np.clip(Y2, 0.0, 1.0)
+    cf = 1.0 + (float(cfg.contrast_factor) - 1.0) * pop
+    pivot = float(np.clip(cfg.contrast_pivot, 0.0, 1.0))
+    yv = np.linspace(0.0, 1.0, _N, dtype=np.float64)
+    Yc = np.clip(pivot + cf * (yv - pivot), 0.0, 1.0)
+    ratio_c = np.clip(Yc / np.maximum(yv, 1e-4), 0.85, 1.35).astype(np.float32)
+    bgr01 = _apply_y_ratio_lut(bgr01, Y, ratio_c, mask=subject_mask)
+    c_dbg = {"applied": True, "cf": cf, "pivot": pivot}
 
-    ratio = Y2 / np.maximum(Y, 1e-4)
-    ratio = np.clip(ratio, 0.80, 1.0).astype(np.float32)
-    out = np.clip(bgr01 * ratio[..., None], 0.0, 1.0)
+    idx = np.clip(Y * np.float32(_N - 1) + np.float32(0.5), 0, _N - 1).astype(np.uint16)
+    ratio_at_Y = np.where(subject_mask, ratio_c[idx], np.float32(1.0))
+    Y = np.clip(Y * ratio_at_Y, 0.0, 1.0)
 
-    return out, {"applied": True}
+    amt = float(np.clip(cfg.microcontrast_amount, 0.0, 2.0)) * pop
+    if amt > 1e-6:
+        blur = cv2.GaussianBlur(Y, (0, 0), float(cfg.microcontrast_radius))
+        Y2 = np.clip(Y + amt * (Y - blur), 0.0, 1.0)
+        ratio_mc = Y2 / np.maximum(Y, 1e-4)
+        np.clip(ratio_mc, 0.90, 1.20, out=ratio_mc)
+        ratio_mc = np.where(subject_mask, ratio_mc, np.float32(1.0))
+        out = bgr01 * ratio_mc[..., None]
+        np.clip(out, 0.0, 1.0, out=out)
+        bgr01 = out.astype(np.float32, copy=False)
+        mc_dbg = {
+            "applied": True,
+            "amt": amt,
+            "radius": float(cfg.microcontrast_radius),
+        }
 
-
-def highlight_detint(
-    bgr01: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    if not cfg.highlight_detint_enable:
-        return bgr01, {"applied": False}
-
-    Y = luma01_from_bgr01_srgb(bgr01)
-    w = smoothstep(
-        Y, float(cfg.highlight_detint_start), float(cfg.highlight_detint_end)
-    )
-    a = float(np.clip(cfg.highlight_detint_strength, 0.0, 1.0))
-    w = w * a
-    if float(w.max()) <= 1e-6:
-        return bgr01, {"applied": False}
-
-    m = np.max(bgr01, axis=2, keepdims=True)
-    out = np.clip(bgr01 * (1.0 - w[..., None]) + m * w[..., None], 0.0, 1.0)
-    return out, {"applied": True}
+    return bgr01, c_dbg, mc_dbg
 
 
-def apply_vibrance_ycrb_protected(
-    bgr01: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+def apply_vibrance_ycrb_protected(bgr01, cfg):
     v = float(np.clip(cfg.vibrance, 0.0, 2.0))
     if v <= 1e-6:
         return bgr01, {"applied": False}
 
-    Y_orig = luma01_from_bgr01_srgb(bgr01).astype(np.float32)
+    Y_orig = luma01_from_bgr01_srgb(bgr01)
 
-    bgr8 = float01_to_bgr8(bgr01)
-    ycrcb = cv2.cvtColor(bgr8, cv2.COLOR_BGR2YCrCb).astype(np.float32)
-    Y8 = ycrcb[..., 0]
-    Cr = ycrcb[..., 1]
-    Cb = ycrcb[..., 2]
+    bgr_c = _ensure_contiguous(bgr01.astype(np.float32, copy=False))
+    ycrcb = cv2.transform(bgr_c, _M_BGR2YCrCb)
 
-    dCr = Cr - 128.0
-    dCb = Cb - 128.0
-    chroma = np.sqrt(dCr * dCr + dCb * dCb)
+    dCr = ycrcb[..., 1] - 0.5
+    dCb = ycrcb[..., 2] - 0.5
+    chroma = cv2.magnitude(dCr, dCb)
 
-    chroma_norm = np.clip(chroma / 128.0, 0.0, 1.0)
-    base_boost = 1.0 + v * (1.0 - chroma_norm)
-    base_boost = np.clip(base_boost, 1.0, float(cfg.vibrance_max_boost))
-
-    Y01 = (Y8 / 255.9).astype(np.float32)
-    wh = smoothstep(Y01, cfg.vibrance_highlight_start, cfg.vibrance_highlight_end)
-    highlight_keep = 1.0 - wh
-
-    c0 = float(max(cfg.vibrance_neutral_chroma_max, 0.0))
-    c1 = float(max(cfg.vibrance_neutral_soft, c0 + 1.0))
-    neutral_ramp = np.clip((chroma - c0) / (c1 - c0), 0.0, 1.0)
-
-    eff = 1.0 + (base_boost - 1.0) * (highlight_keep * neutral_ramp)
-
-    dCr2 = dCr * eff
-    dCb2 = dCb * eff
-
-    Cr2 = np.clip(128.0 + dCr2, 0.0, 255.0)
-    Cb2 = np.clip(128.0 + dCb2, 0.0, 255.0)
-    ycrcb[..., 1] = Cr2
-    ycrcb[..., 2] = Cb2
-
-    out8 = cv2.cvtColor(
-        np.clip(ycrcb + 0.5, 0, 255).astype(np.uint8), cv2.COLOR_YCrCb2BGR
+    c0 = float(max(cfg.vibrance_neutral_chroma_max, 0.0)) / 255.0
+    c1 = (
+        float(max(cfg.vibrance_neutral_soft, cfg.vibrance_neutral_chroma_max + 1.0))
+        / 255.0
     )
-    out = out8.astype(np.float32) / 255.0
+    neutral_ramp = np.clip((chroma - c0) / max(c1 - c0, 1e-6), 0.0, 1.0)
 
-    Y_new = luma01_from_bgr01_srgb(out).astype(np.float32)
+    wh = smoothstep(
+        ycrcb[..., 0], cfg.vibrance_highlight_start, cfg.vibrance_highlight_end
+    )
+    np.subtract(1.0, wh, out=wh)
+
+    np.multiply(wh, neutral_ramp, out=wh)
+
+    chroma_norm = np.clip(chroma / 0.5, 0.0, 1.0)
+    np.subtract(1.0, chroma_norm, out=chroma_norm)
+    np.multiply(chroma_norm, v, out=chroma_norm)
+    np.clip(chroma_norm, 0.0, float(cfg.vibrance_max_boost) - 1.0, out=chroma_norm)
+
+    np.multiply(chroma_norm, wh, out=chroma_norm)
+    np.add(chroma_norm, 1.0, out=chroma_norm)
+
+    np.multiply(dCr, chroma_norm, out=dCr)
+    np.multiply(dCb, chroma_norm, out=dCb)
+    np.add(dCr, 0.5, out=dCr)
+    np.add(dCb, 0.5, out=dCb)
+    ycrcb[..., 1] = dCr
+    ycrcb[..., 2] = dCb
+
+    ycrcb = _ensure_contiguous(ycrcb)
+    out = cv2.transform(ycrcb, _M_YCrCb2BGR)
+    np.clip(out, 0.0, 1.0, out=out)
+
+    Y_new = luma01_from_bgr01_srgb(out)
     ratio = Y_orig / np.maximum(Y_new, 1e-4)
-    ratio = np.clip(ratio, 0.95, 1.05).astype(np.float32)
-    out = np.clip(out * ratio[..., None], 0.0, 1.0)
+    np.clip(ratio, 0.95, 1.05, out=ratio)
+    np.multiply(out, ratio[..., None], out=out)
+    np.clip(out, 0.0, 1.0, out=out)
+    return out.astype(np.float32, copy=False), {"applied": True}
 
-    return np.clip(out, 0.0, 1.0), {"applied": True}
 
-
-def apply_unsharp_mask(bgr8: np.ndarray, cfg: Config) -> np.ndarray:
+def apply_unsharp_mask(bgr8, cfg):
     if cfg.sharpness_amount <= 0:
         return bgr8
-    blurred = cv2.GaussianBlur(
-        bgr8,
-        (
-            0,
-            0,
-        ),
-        cfg.sharpness_radius,
-    )
+    blurred = cv2.GaussianBlur(bgr8, (0, 0), cfg.sharpness_radius)
     sharpened = cv2.addWeighted(
         bgr8, 1.0 + cfg.sharpness_amount, blurred, -cfg.sharpness_amount, 0
     )
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
-def apply_subject_contrast(
-    bgr01: np.ndarray, subject_mask: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    pop = float(np.clip(cfg.pop_strength, 0.0, 1.0))
-    if pop <= 1e-6:
-        return bgr01, {"applied": False}
+def process_bgr16(bgr16, cfg, anchor_wb_gains_rgb_lin, _profile=False):
+    dbg = {}
+    timings = {}
 
-    cf = 1.0 + (float(cfg.contrast_factor) - 1.0) * pop
-    Y = luma01_from_bgr01_srgb(bgr01)
-    pivot = float(np.clip(cfg.contrast_pivot, 0.0, 1.0))
-    Yc = np.clip(pivot + cf * (Y - pivot), 0.0, 1.0)
+    def _t():
+        return time.perf_counter()
 
-    ratio = Yc / np.maximum(Y, 1e-4)
-    ratio = np.clip(ratio, 0.85, 1.35).astype(np.float32)
+    t_start = _t()
 
-    out = bgr01.copy()
-    out_subj = np.clip(bgr01 * ratio[..., None], 0.0, 1.0)
-    out[subject_mask] = out_subj[subject_mask]
-    return out, {"applied": True, "cf": cf, "pivot": pivot}
-
-
-def apply_subject_microcontrast(
-    bgr01: np.ndarray, subject_mask: np.ndarray, cfg: Config
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    pop = float(np.clip(cfg.pop_strength, 0.0, 1.0))
-    amt = float(np.clip(cfg.microcontrast_amount, 0.0, 2.0)) * pop
-    if amt <= 1e-6:
-        return bgr01, {"applied": False}
-
-    Y = luma01_from_bgr01_srgb(bgr01)
-    blur = cv2.GaussianBlur(Y, (0, 0), float(cfg.microcontrast_radius))
-    detail = Y - blur
-    Y2 = np.clip(Y + amt * detail, 0.0, 1.0)
-    ratio = Y2 / np.maximum(Y, 1e-4)
-    ratio = np.clip(ratio, 0.90, 1.20).astype(np.float32)
-
-    out = bgr01.copy()
-    out_subj = np.clip(bgr01 * ratio[..., None], 0.0, 1.0)
-    out[subject_mask] = out_subj[subject_mask]
-    return out, {"applied": True, "amt": amt, "radius": float(cfg.microcontrast_radius)}
-
-
-def process_bgr16(
-    bgr16: np.ndarray,
-    cfg: Config,
-    anchor_wb_gains_rgb_lin: Optional[np.ndarray],
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    dbg: Dict[str, Any] = {}
-
+    t0 = _t()
     bgr16_2, wb16_dbg = opencv_white_balance_bgr16(bgr16, cfg)
     dbg["wb_opencv"] = wb16_dbg
+    timings["wb_opencv"] = _t() - t0
 
+    t0 = _t()
     bgr01_full = bgr16_to_float01(bgr16_2)
+    timings["bgr16_to_float"] = _t() - t0
 
+    t0 = _t()
     if anchor_wb_gains_rgb_lin is not None:
         bgr01_full = apply_anchor_wb_linear_rgb(bgr01_full, anchor_wb_gains_rgb_lin)
         dbg["wb_anchor"] = {
@@ -946,54 +974,103 @@ def process_bgr16(
         }
     else:
         dbg["wb_anchor"] = {"applied": False, "reason": "no_anchor_gains"}
+    timings["anchor_wb"] = _t() - t0
 
+    t0 = _t()
     bgr01_think, think_dbg = _thinking_resize_bgr01(bgr01_full, cfg)
     dbg["thinking"] = think_dbg
+    timings["think_resize_1"] = _t() - t0
 
-    scene = detect_white_product_scene(bgr01_think)
+    t0 = _t()
+    bgr8_t = float01_to_bgr8(bgr01_think)
+    hsv_t = cv2.cvtColor(bgr8_t, cv2.COLOR_BGR2HSV).astype(np.float32)
+    Ylin_t = luma01_from_bgr01_linear(bgr01_think)
+    timings["think_convert_1"] = _t() - t0
+
+    t0 = _t()
+    scene = detect_white_product_scene(bgr01_think, bgr8=bgr8_t)
     dbg["scene"] = scene
+    timings["scene_detect"] = _t() - t0
 
-    bg_mask_t = compute_bg_mask(bgr01_think, cfg)
-    spec_mask_t = compute_specular_mask(bgr01_think, cfg)
+    t0 = _t()
+    bg_mask_t = compute_bg_mask(bgr01_think, cfg, hsv=hsv_t)
+    spec_mask_t = compute_specular_mask(bgr01_think, cfg, hsv=hsv_t, Ylin=Ylin_t)
+    timings["masks_1"] = _t() - t0
 
+    t0 = _t()
+    Y_pre_exp = luma01_from_bgr01_srgb(bgr01_full)
     pre_exposure_ref_full = bgr01_full.copy()
+    timings["copy_pre_exp"] = _t() - t0
 
+    t0 = _t()
     exp_dbg = compute_exposure_gain_from_bg(bgr01_think, bg_mask_t, spec_mask_t, cfg)
-    bgr01_full = apply_gain_linear_rgb(bgr01_full, float(exp_dbg["gain"]))
     dbg["exposure_bg_linear"] = exp_dbg
+    timings["exposure_calc"] = _t() - t0
 
-    bgr01_think = apply_gain_linear_rgb(bgr01_think, float(exp_dbg["gain"]))
-
+    gain_total = float(exp_dbg["gain"])
     fb = float(cfg.final_brightness)
     if abs(fb - 1.0) > 1e-4:
-        bgr01_full = apply_gain_linear_rgb(bgr01_full, fb)
-        bgr01_think = apply_gain_linear_rgb(bgr01_think, fb)
+        gain_total *= fb
         dbg["final_brightness"] = {"applied": True, "gain": fb}
     else:
         dbg["final_brightness"] = {"applied": False}
 
-    bg_mask2_t = compute_bg_mask(bgr01_think, cfg)
-    spec_mask2_t = compute_specular_mask(bgr01_think, cfg)
+    t0 = _t()
+    if abs(gain_total - 1.0) > 1e-6:
+        bgr01_think = apply_gain_linear_bgr(bgr01_think, gain_total)
+    timings["gain_think"] = _t() - t0
 
+    t0 = _t()
+    bgr8_t2 = float01_to_bgr8(bgr01_think)
+    hsv_t2 = cv2.cvtColor(bgr8_t2, cv2.COLOR_BGR2HSV).astype(np.float32)
+    Ylin_t2 = luma01_from_bgr01_linear(bgr01_think)
+    timings["think_convert_2"] = _t() - t0
+
+    t0 = _t()
+    bg_mask2_t = compute_bg_mask(bgr01_think, cfg, hsv=hsv_t2)
+    spec_mask2_t = compute_specular_mask(bgr01_think, cfg, hsv=hsv_t2, Ylin=Ylin_t2)
+    timings["masks_2"] = _t() - t0
+
+    t0 = _t()
     wb_bg_dbg = compute_bg_whiten_gain(bgr01_think, bg_mask2_t, spec_mask2_t, cfg)
-    if float(wb_bg_dbg.get("gain", 1.0)) != 1.0:
-        g = float(wb_bg_dbg["gain"])
-        bgr01_full = apply_gain_linear_rgb(bgr01_full, g)
-        bgr01_think = apply_gain_linear_rgb(bgr01_think, g)
     dbg["bg_whiten_failsafe"] = wb_bg_dbg
+    timings["bg_whiten_calc"] = _t() - t0
 
-    bgr01_full, hp_dbg = highlight_protect_blend(pre_exposure_ref_full, bgr01_full, cfg)
+    g_bg = float(wb_bg_dbg.get("gain", 1.0))
+    if g_bg != 1.0:
+        gain_total *= g_bg
+
+    t0 = _t()
+    if abs(gain_total - 1.0) > 1e-6:
+        bgr01_full = apply_gain_linear_bgr(bgr01_full, gain_total)
+    timings["gain_full"] = _t() - t0
+
+    t0 = _t()
+    bgr01_full, hp_dbg = highlight_protect_blend(
+        pre_exposure_ref_full, bgr01_full, cfg, Y_original=Y_pre_exp
+    )
     dbg["highlight_protect"] = hp_dbg
+    timings["highlight_protect"] = _t() - t0
+    del pre_exposure_ref_full, Y_pre_exp
 
+    t0 = _t()
     bgr01_think, _ = _thinking_resize_bgr01(bgr01_full, cfg)
+    bgr8_t3 = float01_to_bgr8(bgr01_think)
+    hsv_t3 = cv2.cvtColor(bgr8_t3, cv2.COLOR_BGR2HSV).astype(np.float32)
+    Ylin_t3 = luma01_from_bgr01_linear(bgr01_think)
+    timings["think_resize_convert_3"] = _t() - t0
 
-    bg_mask3_t = compute_bg_mask(bgr01_think, cfg)
-    spec_mask3_t = compute_specular_mask(bgr01_think, cfg)
+    t0 = _t()
+    bg_mask3_t = compute_bg_mask(bgr01_think, cfg, hsv=hsv_t3)
+    spec_mask3_t = compute_specular_mask(bgr01_think, cfg, hsv=hsv_t3, Ylin=Ylin_t3)
     subj_mask_t = compute_subject_mask(bg_mask3_t)
+    timings["masks_3"] = _t() - t0
 
+    t0 = _t()
     subj_mask_full = _upsample_mask_nn(subj_mask_t, bgr01_full.shape[:2])
     bg_mask_full = _upsample_mask_nn(bg_mask3_t, bgr01_full.shape[:2])
     spec_mask_full = _upsample_mask_nn(spec_mask3_t, bgr01_full.shape[:2])
+    timings["mask_upsample"] = _t() - t0
 
     dbg["mask_counts"] = {
         "bg": int(bg_mask_full.sum()),
@@ -1001,31 +1078,62 @@ def process_bgr16(
         "spec": int(spec_mask_full.sum()),
     }
 
-    bgr01_full, sh_dbg = apply_shadows_lift(bgr01_full, cfg)
-    dbg["shadows_lift"] = sh_dbg
+    t0 = _t()
+    bgr01_full, sh_mt_dbg = apply_shadows_and_midtone_fused(bgr01_full, cfg, scene)
+    dbg["shadows_lift"] = sh_mt_dbg.get("shadows", {})
+    dbg["midtone_lift"] = sh_mt_dbg.get("midtone", {})
+    timings["shadows_midtone_fused"] = _t() - t0
 
-    bgr01_full, lift_dbg = adaptive_midtone_lift(bgr01_full, cfg, scene)
-    dbg["midtone_lift"] = lift_dbg
-
+    t0 = _t()
     bgr01_full, v_dbg = apply_vibrance_ycrb_protected(bgr01_full, cfg)
     dbg["vibrance_ycrcb"] = v_dbg
+    timings["vibrance"] = _t() - t0
 
-    bgr01_full, c_dbg = apply_subject_contrast(bgr01_full, subj_mask_full, cfg)
-    bgr01_full, mc_dbg = apply_subject_microcontrast(bgr01_full, subj_mask_full, cfg)
+    t0 = _t()
+    bgr01_full, c_dbg, mc_dbg = apply_subject_pop(bgr01_full, subj_mask_full, cfg)
     dbg["subject_contrast"] = c_dbg
     dbg["subject_microcontrast"] = mc_dbg
+    timings["subject_pop"] = _t() - t0
 
-    bgr01_full, hr_dbg = highlight_rolloff(bgr01_full, cfg)
-    bgr01_full, hd_dbg = highlight_detint(bgr01_full, cfg)
+    t0 = _t()
+    bgr01_full, hr_dbg, hd_dbg = highlight_roll_and_detint(bgr01_full, cfg)
     dbg["highlight_rolloff"] = hr_dbg
     dbg["highlight_detint"] = hd_dbg
+    timings["highlight_roll_detint"] = _t() - t0
 
+    t0 = _t()
     bgr8 = float01_to_bgr8(bgr01_full)
     bgr8 = apply_unsharp_mask(bgr8, cfg)
+    timings["sharpen_output"] = _t() - t0
+
+    timings["TOTAL"] = _t() - t_start
+
+    if _profile:
+        print("\n── PIPELINE PROFILE ──")
+        for name, dur in sorted(timings.items(), key=lambda kv: -kv[1]):
+            pct = dur / timings["TOTAL"] * 100.0
+            print(f"  {name:<30s} {dur:6.3f}s  {pct:5.1f}%  {'█' * int(pct / 2)}")
+        print()
+
+    dbg["timings"] = timings
     return bgr8, dbg
 
 
-def find_xrite_file(input_dir: Path, cfg: Config) -> Optional[Path]:
+def iter_images_prefetched(input_dir, cfg):
+    file_list = list(iter_images(input_dir))
+    if not file_list:
+        return
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        fut = io_pool.submit(read_image_any_to_bgr16, file_list[0], cfg)
+        for i, p in enumerate(file_list):
+            bgr16 = fut.result()
+            if i + 1 < len(file_list):
+                fut = io_pool.submit(read_image_any_to_bgr16, file_list[i + 1], cfg)
+            if bgr16 is not None:
+                yield p, bgr16
+
+
+def find_xrite_file(input_dir, cfg):
     candidates = [p for p in iter_images(input_dir) if _is_xrite_file(p, cfg)]
     if not candidates:
         return None
@@ -1033,32 +1141,28 @@ def find_xrite_file(input_dir: Path, cfg: Config) -> Optional[Path]:
     return candidates[0]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=str, default="input")
-    ap.add_argument("--output", type=str, default="output")
+    ap.add_argument("--input", type=str, default="input/hidden_2")
+    ap.add_argument("--output", type=str, default="output/cr2_test")
     ap.add_argument("--quality", type=int, default=CFG.jpeg_quality)
     ap.add_argument("--sharpness", type=float, default=CFG.sharpness_amount)
     ap.add_argument("--vibrance", type=float, default=CFG.vibrance)
-
     ap.add_argument("--contrast", type=float, default=CFG.contrast_factor)
     ap.add_argument("--contrast-pivot", type=float, default=CFG.contrast_pivot)
     ap.add_argument("--pop", type=float, default=CFG.pop_strength)
     ap.add_argument("--microcontrast", type=float, default=CFG.microcontrast_amount)
     ap.add_argument("--micro-radius", type=float, default=CFG.microcontrast_radius)
-
     ap.add_argument("--shadows", type=float, default=CFG.shadows_lift)
     ap.add_argument("--shadows-end", type=float, default=CFG.shadows_end)
     ap.add_argument("--xrite-hint", type=str, default=CFG.xrite_name_hint)
     ap.add_argument("--no-skip-xrite-export", action="store_true")
     ap.add_argument("--xrite-required", action="store_true")
-
     ap.add_argument("--wb-strength", type=float, default=CFG.wb_strength)
     ap.add_argument("--wb-sat-max", type=float, default=CFG.wb_sat_max)
     ap.add_argument("--wb-y-min", type=float, default=CFG.wb_y_min)
     ap.add_argument("--wb-y-max", type=float, default=CFG.wb_y_max)
     ap.add_argument("--wb-min-pixels", type=int, default=CFG.wb_min_pixels)
-
     ap.add_argument("--opencv-wb", action="store_true")
     ap.add_argument(
         "--opencv-wb-mode",
@@ -1066,30 +1170,58 @@ def parse_args() -> argparse.Namespace:
         default=CFG.opencv_wb_mode,
         choices=["simple", "grayworld"],
     )
-
     ap.add_argument("--no-bg-whiten", action="store_true")
     ap.add_argument("--bg-whiten-target", type=float, default=CFG.bg_whiten_target)
     ap.add_argument("--bg-whiten-max", type=float, default=CFG.bg_whiten_gain_max)
-
+    ap.add_argument("--think-long-edge", type=int, default=CFG.think_long_edge)
+    ap.add_argument("--think-min-edge", type=int, default=CFG.think_min_edge)
     ap.add_argument(
-        "--think-long-edge",
-        type=int,
-        default=CFG.think_long_edge,
-        help="Compute masks/percentiles at this long-edge size (edits still full-res).",
+        "--profile", action="store_true", help="Print per-step timing for first image."
     )
     ap.add_argument(
-        "--think-min-edge",
+        "--workers",
         type=int,
-        default=CFG.think_min_edge,
-        help="Minimum short-edge size for thinking resize (prevents too-tiny masks).",
+        default=2,
+        help="Parallel workers for batch processing (default 2, use 1 for sequential).",
     )
-
     return ap.parse_args()
 
 
-def main() -> None:
-    t0 = time.perf_counter()
+def _process_single(args_tuple):
+    """Worker for ProcessPoolExecutor. Receives serialized args to avoid pickle issues."""
+    (
+        img_path_str,
+        input_dir_str,
+        output_dir_str,
+        cfg_dict,
+        anchor_wb_list,
+        jpeg_quality,
+    ) = args_tuple
+    cfg = Config()
+    for k, v in cfg_dict.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    p = Path(img_path_str)
+    anchor_wb = np.array(anchor_wb_list, dtype=np.float32) if anchor_wb_list else None
+    bgr16 = read_image_any_to_bgr16(p, cfg)
+    if bgr16 is None:
+        return (p.name, False, "read_failed")
+    out8, dbg = process_bgr16(bgr16, cfg, anchor_wb)
+    rel = p.relative_to(input_dir_str)
+    out_path = (Path(output_dir_str) / rel).with_suffix(".jpg")
+    write_jpeg(out_path, out8, jpeg_quality)
+    exp = dbg.get("exposure_bg_linear", {})
+    think = dbg.get("thinking", {})
+    return (
+        p.name,
+        True,
+        f"ExpGain={exp.get('gain',0):.2f}({exp.get('ref','?')}) "
+        f"ThinkScale={think.get('scale',1.0):.3f}",
+    )
 
+
+def main():
+    t0 = time.perf_counter()
     args = parse_args()
     input_dir = Path(args.input).expanduser().resolve()
     output_dir = Path(args.output).expanduser().resolve()
@@ -1137,8 +1269,7 @@ def main() -> None:
     ensure_dir(output_dir)
 
     anchor_path = find_xrite_file(input_dir, cfg)
-    anchor_wb: Optional[np.ndarray] = None
-
+    anchor_wb = None
     if anchor_path is None:
         msg = f"[WARN] No xrite anchor found (hint='{cfg.xrite_name_hint}')"
         if cfg.xrite_required:
@@ -1169,6 +1300,8 @@ def main() -> None:
     count_tagged = 0
 
     run_date = date.today().isoformat()
+    do_profile = bool(args.profile)
+    n_workers = max(1, int(args.workers))
 
     print(f"Processing images from {input_dir} -> {output_dir}")
     print(
@@ -1177,40 +1310,79 @@ def main() -> None:
         f"Vibrance={cfg.vibrance} | Shadows={cfg.shadows_lift} | "
         f"AnchorWB={'on' if anchor_wb is not None else 'off'} | "
         f"BGWhiten={'on' if cfg.bg_whiten_enable else 'off'} | "
-        f"ThinkLongEdge={cfg.think_long_edge} (min {cfg.think_min_edge})"
+        f"ThinkLongEdge={cfg.think_long_edge} (min {cfg.think_min_edge}) | "
+        f"Workers={n_workers}"
     )
 
-    for p in iter_images(input_dir):
-        count_in += 1
+    all_files = [
+        p
+        for p in iter_images(input_dir)
+        if not (cfg.xrite_skip_export and _is_xrite_file(p, cfg))
+    ]
+    count_in = len(all_files)
 
-        if cfg.xrite_skip_export and _is_xrite_file(p, cfg):
-            print(f"Skip (xrite ref): {p.name}")
-            continue
-        bgr16 = read_image_any_to_bgr16(p, cfg)
-        if bgr16 is None:
-            print(f"[WARN] Could not read {p}")
-            continue
+    if n_workers >= 2 and count_in >= 2:
+        if do_profile and all_files:
+            bgr16_first = read_image_any_to_bgr16(all_files[0], cfg)
+            if bgr16_first is not None:
+                process_bgr16(bgr16_first, cfg, anchor_wb, _profile=True)
+                del bgr16_first
 
-        out8, dbg = process_bgr16(bgr16, cfg, anchor_wb)
+        cfg_dict = {k: getattr(cfg, k) for k in vars(cfg) if not k.startswith("_")}
+        anchor_list = anchor_wb.tolist() if anchor_wb is not None else None
 
-        rel = p.relative_to(input_dir)
-        out_path = (output_dir / rel).with_suffix(".jpg")
-        write_jpeg(out_path, out8, cfg.jpeg_quality)
-        count_out += 1
+        work_items = [
+            (
+                str(p),
+                str(input_dir),
+                str(output_dir),
+                cfg_dict,
+                anchor_list,
+                cfg.jpeg_quality,
+            )
+            for p in all_files
+        ]
 
-        exp = dbg.get("exposure_bg_linear", {})
-        wb_bg = dbg.get("bg_whiten_failsafe", {})
-        c = dbg.get("subject_contrast", {})
-        mc = dbg.get("subject_microcontrast", {})
-        think = dbg.get("thinking", {})
-        print(
-            f"Saved: {output_dir.name} | "
-            f"ExpGain={exp.get('gain',0):.2f}({exp.get('ref', '?')})"
-            f"BGWhiten={('on' if wb_bg.get('applied') else 'off')} "
-            f"SubContrast={('on' if c.get('applied') else 'off')} "
-            f"Micro={('on' if mc.get('applied') else 'off')}"
-            f"ThinkScale={think.get('scale', 1.0):.3f}"
-        )
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_process_single, item): item[0] for item in work_items
+            }
+            for fut in as_completed(futures):
+                name, ok, msg = fut.result()
+                if ok:
+                    count_out += 1
+                print(
+                    f"[{count_out}/{count_in}] {'OK' if ok else 'FAIL'} {name}  {msg}"
+                )
+
+    else:
+        for p, bgr16 in iter_images_prefetched(input_dir, cfg):
+            count_in += 1
+            if cfg.xrite_skip_export and _is_xrite_file(p, cfg):
+                print(f"Skip (xrite ref): {p.name}")
+                continue
+
+            profile_this = do_profile and (count_out == 0)
+            out8, dbg = process_bgr16(bgr16, cfg, anchor_wb, _profile=profile_this)
+
+            rel = p.relative_to(input_dir)
+            out_path = (output_dir / rel).with_suffix(".jpg")
+            write_jpeg(out_path, out8, cfg.jpeg_quality)
+            count_out += 1
+
+            exp = dbg.get("exposure_bg_linear", {})
+            wb_bg = dbg.get("bg_whiten_failsafe", {})
+            c = dbg.get("subject_contrast", {})
+            mc = dbg.get("subject_microcontrast", {})
+            think = dbg.get("thinking", {})
+            print(
+                f"Saved: {output_dir.name} | "
+                f"ExpGain={exp.get('gain',0):.2f}({exp.get('ref', '?')}) "
+                f"BGWhiten={('on' if wb_bg.get('applied') else 'off')} "
+                f"SubContrast={('on' if c.get('applied') else 'off')} "
+                f"Micro={('on' if mc.get('applied') else 'off')} "
+                f"ThinkScale={think.get('scale', 1.0):.3f}"
+            )
 
     total = time.perf_counter() - t0
     rate = (count_out / total) if total > 0 else 0.0
